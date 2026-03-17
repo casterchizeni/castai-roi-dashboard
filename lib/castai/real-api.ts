@@ -254,3 +254,31 @@ export async function getRebalancingSchedules(apiKey: string): Promise<Rebalanci
   const data = await get<{ schedules: RebalancingSchedule[] }>('rebalancing-schedules', apiKey);
   return data.schedules ?? [];
 }
+
+// ─── Commitments (RIs / Savings Plans / CUDs) ────────────────────────────────
+
+export interface RawCommitment {
+  id: string;
+  cloudProviderCommitmentId: string;
+  allowedUsage: {
+    instanceType: string;
+    instanceFamily: string;
+    region: string;
+  };
+  count: number;
+  instanceTypeCpu: number;
+  effectiveCpu: number;
+  totalCost: string;          // string from API, may be empty
+  plan: string;
+  state: string;
+  status: string;
+  startDate: string;
+  endDate: string;
+  region: string;
+  cloudServiceProvider: string;
+}
+
+export async function getCommitments(apiKey: string): Promise<RawCommitment[]> {
+  const data = await get<{ items: RawCommitment[] }>('savings/commitments', apiKey);
+  return data.items ?? [];
+}

@@ -28,6 +28,7 @@ const REC_TYPE_STYLES: Record<Recommendation['type'], { bg: string; icon: string
   'high-overprovisioning': { bg: 'bg-orange-50', icon: '!', border: 'border-orange-200', label: 'Overprovisioning' },
   'low-spot-adoption': { bg: 'bg-blue-50', icon: '~', border: 'border-blue-200', label: 'Low Optimization' },
   'no-baseline': { bg: 'bg-gray-50', icon: '?', border: 'border-gray-200', label: 'No Baseline' },
+  'inactive-ri': { bg: 'bg-teal-50', icon: 'RI', border: 'border-teal-200', label: 'Unused RI' },
 };
 
 const BASELINE_BADGE: Record<ClusterOrgSummary['baselineQuality'], { bg: string; dot: string; label: string }> = {

@@ -1,9 +1,10 @@
 import type { ClusterOrgSummary } from '@/app/api/org/[orgName]/route';
+import type { CommitmentSummary } from '@/types/castai';
 
 export interface Recommendation {
   clusterId: string;
   clusterName: string;
-  type: 'high-overprovisioning' | 'low-spot-adoption' | 'no-baseline';
+  type: 'high-overprovisioning' | 'low-spot-adoption' | 'no-baseline' | 'inactive-ri';
   message: string;
   potentialSavings?: number;
 }
@@ -15,6 +16,21 @@ export interface ClusterStory {
   monthlySavings: number;
   costReductionPct: number;
   story: string;
+}
+
+export interface CommitmentROILayer {
+  totalActiveRIs: number;
+  coveragePct: number;
+  avgRiCostPerCpuHr: number | null;
+  estimatedMonthlyRiSpend: number;
+  inactiveCount: number;
+  missingCostCount: number;
+  preCastCount: number;
+  postCastCount: number;
+  // Three-layer decomposition
+  onDemandRatePerCpuHr: number | null;  // from baseline costPerCpuHr
+  riRatePerCpuHr: number | null;         // from commitment totalCost
+  castaiRatePerCpuHr: number | null;     // from current efficiency
 }
 
 export interface MultiClusterROI {
@@ -39,6 +55,14 @@ export interface MultiClusterROI {
   avgCpuOverprovAfter: number;
   avgCpuUtilBefore: number;
   avgCpuUtilAfter: number;
+
+  // Savings decomposition (from CAST AI model — 90d spot vs rightsizing)
+  totalSpotSavings: number;
+  totalRightsizingSavings: number;
+  savingsDecompositionSource: 'cast-ai-model';
+
+  // Commitment layer (optional — only when org has RIs)
+  commitments?: CommitmentROILayer;
 
   // Per-cluster stories
   clusterStories: ClusterStory[];
@@ -101,6 +125,7 @@ function buildClusterStory(c: ClusterOrgSummary): ClusterStory {
 export function computeMultiClusterROI(
   clusters: ClusterOrgSummary[],
   monthlyFee: number,
+  commitmentSummary?: CommitmentSummary,
 ): MultiClusterROI {
   // Baseline-derived savings (the core method)
   const withBaseline = clusters.filter(
@@ -142,6 +167,10 @@ export function computeMultiClusterROI(
     ? withUtilAfter.reduce((s, c) => s + c.castaiCpuUtil, 0) / withUtilAfter.length
     : 0;
 
+  // Savings decomposition (from CAST AI savings API)
+  const totalSpotSavings = clusters.reduce((s, c) => s + c.spotSavings90d, 0);
+  const totalRightsizingSavings = clusters.reduce((s, c) => s + c.rightsizingSavings90d, 0);
+
   // Per-cluster stories
   const clusterStories = clusters.map(buildClusterStory);
 
@@ -177,6 +206,48 @@ export function computeMultiClusterROI(
     }
   }
 
+  // Commitment layer (optional)
+  let commitments: CommitmentROILayer | undefined;
+  if (commitmentSummary && commitmentSummary.activeCommitments > 0) {
+    // On-demand rate: weighted avg of baseline costPerCpuHr across clusters with baseline
+    const clustersWithCpuRate = withBaseline.filter((c) => c.baselineCostPerCpuHr > 0);
+    const onDemandRatePerCpuHr = clustersWithCpuRate.length > 0
+      ? clustersWithCpuRate.reduce((s, c) => s + c.baselineCostPerCpuHr, 0) / clustersWithCpuRate.length
+      : null;
+
+    const riRatePerCpuHr = commitmentSummary.avgCostPerCpuHr;
+
+    // CAST AI optimized rate: weighted avg of castaiCostPerCpuHr
+    const clustersWithCurrentRate = clusters.filter((c) => c.castaiCostPerCpuHr > 0);
+    const castaiRatePerCpuHr = clustersWithCurrentRate.length > 0
+      ? clustersWithCurrentRate.reduce((s, c) => s + c.castaiCostPerCpuHr, 0) / clustersWithCurrentRate.length
+      : null;
+
+    commitments = {
+      totalActiveRIs: commitmentSummary.activeCommitments,
+      coveragePct: commitmentSummary.coveragePct,
+      avgRiCostPerCpuHr: riRatePerCpuHr,
+      estimatedMonthlyRiSpend: commitmentSummary.estimatedMonthlyRiSpend,
+      inactiveCount: commitmentSummary.inactiveInCastAI,
+      missingCostCount: commitmentSummary.missingCostCount,
+      preCastCount: commitmentSummary.preCastAICount,
+      postCastCount: commitmentSummary.postCastAICount,
+      onDemandRatePerCpuHr,
+      riRatePerCpuHr,
+      castaiRatePerCpuHr,
+    };
+
+    // Inactive RI recommendation
+    if (commitmentSummary.inactiveInCastAI > 0) {
+      recommendations.push({
+        clusterId: '',
+        clusterName: 'Organization',
+        type: 'inactive-ri',
+        message: `${commitmentSummary.inactiveInCastAI} reserved instance${commitmentSummary.inactiveInCastAI !== 1 ? 's are' : ' is'} active but not orchestrated by CAST AI. Enabling orchestration could improve RI utilization.`,
+      });
+    }
+  }
+
   return {
     clustersWithBaseline: withBaseline.length,
     clustersWithoutBaseline: clusters.length - withBaseline.length,
@@ -194,6 +265,10 @@ export function computeMultiClusterROI(
     avgCpuOverprovAfter,
     avgCpuUtilBefore,
     avgCpuUtilAfter,
+    totalSpotSavings,
+    totalRightsizingSavings,
+    savingsDecompositionSource: 'cast-ai-model',
+    commitments,
     clusterStories,
     recommendations,
   };

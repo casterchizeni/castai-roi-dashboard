@@ -11,6 +11,7 @@ import {
 import type { OrgDashboardData, ClusterOrgSummary } from '@/app/api/org/[orgName]/route';
 import { computeMultiClusterROI } from '@/lib/calculations/multi-cluster-roi';
 import OrgReportView from '@/components/OrgReportView';
+import CommitmentSummaryCard from '@/components/cards/CommitmentSummaryCard';
 
 function makeFetcher(dynamicKey: string | null) {
   return (url: string) => {
@@ -587,7 +588,7 @@ export default function OrgDashboardPage({
           });
           const excludedCount = filteredClusters.length - roiClusters.length;
 
-          const roi = computeMultiClusterROI(roiClusters, monthlyFee);
+          const roi = computeMultiClusterROI(roiClusters, monthlyFee, data?.commitments);
           const paybackMonths = roi.monthlySavings > 0 && monthlyFee > 0 ? monthlyFee / roi.monthlySavings : 0;
 
           return (
@@ -721,6 +722,72 @@ export default function OrgDashboardPage({
                         </div>
                       </div>
 
+                      {/* $/Requested-CPU-hr — workload-normalized metric */}
+                      {(() => {
+                        const baseReq = roiClusters.filter((c) => c.baselineCostPerRequestedCpuHr > 0);
+                        const castReq = roiClusters.filter((c) => c.castaiCostPerRequestedCpuHr > 0);
+                        const avgBaseReq = baseReq.length ? baseReq.reduce((s, c) => s + c.baselineCostPerRequestedCpuHr, 0) / baseReq.length : 0;
+                        const avgCastReq = castReq.length ? castReq.reduce((s, c) => s + c.castaiCostPerRequestedCpuHr, 0) / castReq.length : 0;
+                        if (avgBaseReq <= 0 && avgCastReq <= 0) return null;
+                        const delta = avgBaseReq > 0 && avgCastReq > 0 ? ((avgCastReq - avgBaseReq) / avgBaseReq) * 100 : 0;
+                        return (
+                          <div className="border-t border-gray-100 pt-3">
+                            <div className="rounded-lg border border-blue-100 bg-blue-50/50 p-3">
+                              <div className="text-xs text-blue-600 font-medium mb-1">$/Requested CPU-hr (workload-normalized)</div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-sm text-gray-500">{avgBaseReq > 0 ? `$${avgBaseReq.toFixed(4)}` : '—'}</span>
+                                <span className="text-gray-300">→</span>
+                                <span className="text-sm font-bold text-gray-800">{avgCastReq > 0 ? `$${avgCastReq.toFixed(4)}` : '—'}</span>
+                                {delta < 0 && (
+                                  <span className="text-xs font-semibold text-emerald-600">↓{Math.abs(delta).toFixed(0)}%</span>
+                                )}
+                              </div>
+                              <p className="text-xs text-gray-400 mt-1">Normalizes for workload growth — if workloads doubled but cost per unit of work went down, that&apos;s real optimization.</p>
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Savings decomposition (spot vs rightsizing) */}
+                      {(roi.totalSpotSavings > 0 || roi.totalRightsizingSavings > 0) && (
+                        <div className="border-t border-gray-100 pt-3">
+                          <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Savings Breakdown (90d)</h4>
+                          <div className="flex gap-3">
+                            <div className="flex-1 rounded-lg border border-purple-100 bg-purple-50/50 p-3 text-center">
+                              <div className="text-lg font-bold text-purple-600">{fmt$(roi.totalSpotSavings)}</div>
+                              <div className="text-xs text-purple-500">Spot adoption</div>
+                            </div>
+                            <div className="flex-1 rounded-lg border border-teal-100 bg-teal-50/50 p-3 text-center">
+                              <div className="text-lg font-bold text-teal-600">{fmt$(roi.totalRightsizingSavings)}</div>
+                              <div className="text-xs text-teal-500">Rightsizing</div>
+                            </div>
+                          </div>
+                          {roi.totalSpotSavings + roi.totalRightsizingSavings > 0 && (
+                            <div className="flex items-center gap-2 mt-2">
+                              <div className="flex-1 bg-gray-100 rounded-full h-2 overflow-hidden">
+                                <div className="h-full bg-purple-500" style={{ width: `${(roi.totalSpotSavings / (roi.totalSpotSavings + roi.totalRightsizingSavings)) * 100}%` }} />
+                              </div>
+                              <span className="text-xs text-gray-400">
+                                {((roi.totalSpotSavings / (roi.totalSpotSavings + roi.totalRightsizingSavings)) * 100).toFixed(0)}% spot / {((roi.totalRightsizingSavings / (roi.totalSpotSavings + roi.totalRightsizingSavings)) * 100).toFixed(0)}% rightsizing
+                              </span>
+                            </div>
+                          )}
+                          <p className="text-xs text-gray-400 mt-1">From CAST AI optimization model (vs on-demand equivalent).</p>
+                        </div>
+                      )}
+
+                      {/* Baseline outlier note */}
+                      {(() => {
+                        const withOutliers = roiClusters.filter((c) => (c.baselineOutlierDays ?? 0) > 0);
+                        if (!withOutliers.length) return null;
+                        const totalOutlierDays = withOutliers.reduce((s, c) => s + (c.baselineOutlierDays ?? 0), 0);
+                        return (
+                          <p className="text-xs text-amber-600 border-t border-gray-100 pt-3">
+                            {totalOutlierDays} anomalous day{totalOutlierDays !== 1 ? 's' : ''} detected in {withOutliers.length} cluster baseline{withOutliers.length !== 1 ? 's' : ''}. Baseline averages use cleaned data (outliers excluded via IQR method).
+                          </p>
+                        );
+                      })()}
+
                       {/* Fee-based ROI */}
                       {monthlyFee > 0 && (
                         <div className="border-t border-gray-100 pt-4">
@@ -772,6 +839,33 @@ export default function OrgDashboardPage({
                   </p>
                 </div>
               )}
+            </div>
+          );
+        })()}
+
+        {/* ── Commitment/RI Summary (overview only, when commitments exist) ─── */}
+        {viewMode === 'overview' && !isLoading && (() => {
+          const roiClusters = filteredClusters.filter((c) => {
+            if (roiTier === 'strong') return c.baselineQuality === 'strong';
+            if (roiTier === 'weak+') return c.baselineQuality === 'strong' || c.baselineQuality === 'weak';
+            return true;
+          });
+          const roi = computeMultiClusterROI(roiClusters, monthlyFee, data?.commitments);
+          if (!roi.commitments) return null;
+          return <CommitmentSummaryCard commitments={roi.commitments} />;
+        })()}
+
+        {/* ── Data freshness warnings (overview only) ─────────────────────────── */}
+        {viewMode === 'overview' && !isLoading && (() => {
+          const staleClusters = filteredClusters.filter((c) => c.dataStale);
+          if (!staleClusters.length) return null;
+          return (
+            <div className="rounded-lg bg-amber-50 border border-amber-200 px-4 py-3 text-sm text-amber-800 flex items-start gap-2">
+              <span className="flex-shrink-0 mt-0.5">&#9888;&#65039;</span>
+              <span>
+                {staleClusters.length} cluster{staleClusters.length !== 1 ? 's have' : ' has'} stale data ({staleClusters.map((c) => c.name).join(', ')}).
+                These may be disconnected from CAST AI.
+              </span>
             </div>
           );
         })()}

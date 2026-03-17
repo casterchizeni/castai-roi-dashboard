@@ -2,10 +2,15 @@ import { NextResponse } from 'next/server';
 import {
   ORG_KEYS,
   listClustersForKey,
+  listNodes,
   getSavings,
   getEfficiency,
+  getCommitments,
 } from '@/lib/castai/real-api';
 import type { RawEfficiencyItem } from '@/lib/castai/efficiency-adapter';
+import type { CommitmentSummary } from '@/types/castai';
+import { adaptCommitments, computeCommitmentSummary } from '@/lib/castai/commitment-adapter';
+import { detectBaselineOutliers } from '@/lib/calculations/outliers';
 
 function providerLabel(p?: string) {
   if (p === 'aks') return 'Azure AKS';
@@ -32,15 +37,17 @@ function computePeriodMetrics(items: RawEfficiencyItem[]): {
   cpuUtil: number;
   cpuOverprov: number;
   costPerCpuHr: number;
+  costPerRequestedCpuHr: number;
   days: number;
 } {
-  if (!items.length) return { dailyCost: 0, cpuUtil: 0, cpuOverprov: 0, costPerCpuHr: 0, days: 0 };
+  if (!items.length) return { dailyCost: 0, cpuUtil: 0, cpuOverprov: 0, costPerCpuHr: 0, costPerRequestedCpuHr: 0, days: 0 };
   const n = (s?: string) => parseFloat(s ?? '0') || 0;
 
   let totalCost = 0;
   const utilSamples: number[] = [];
   const overprovSamples: number[] = [];
   const costPerCpuSamples: number[] = [];
+  const costPerReqCpuSamples: number[] = [];
 
   for (const item of items) {
     const hourlyCost = (
@@ -52,10 +59,15 @@ function computePeriodMetrics(items: RawEfficiencyItem[]): {
 
     const prov = n(item.cpuCountOnDemand) + n(item.cpuCountSpot);
     const used = n(item.cpuUsedOnDemand) + n(item.cpuUsedSpot);
+    const req = n(item.requestedCpuCountOnDemand) + n(item.requestedCpuCountSpot);
     if (prov > 0) {
       utilSamples.push((used / prov) * 100);
       // $/provisioned CPU-hour = all-in hourly cost / provisioned CPUs
       costPerCpuSamples.push(hourlyCost / prov);
+    }
+    if (req > 0) {
+      // $/requested CPU-hour = hourly cost / requested CPUs (workload-normalized)
+      costPerReqCpuSamples.push(hourlyCost / req);
     }
 
     const odPct = n(item.cpuOverprovisioningOnDemandPercent);
@@ -77,6 +89,9 @@ function computePeriodMetrics(items: RawEfficiencyItem[]): {
     costPerCpuHr: costPerCpuSamples.length
       ? costPerCpuSamples.reduce((a, b) => a + b, 0) / costPerCpuSamples.length
       : 0,
+    costPerRequestedCpuHr: costPerReqCpuSamples.length
+      ? costPerReqCpuSamples.reduce((a, b) => a + b, 0) / costPerReqCpuSamples.length
+      : 0,
     days: items.length,
   };
 }
@@ -95,6 +110,10 @@ export interface ClusterOrgSummary {
   cost90d: number;      // $$ you actually paid (with CAST AI active)
   savingsPct: number;   // savings / (savings + cost) — % reduction vs on-demand baseline
 
+  // ── Savings decomposition (from CAST AI savings API items) ────────────────
+  spotSavings90d: number;
+  rightsizingSavings90d: number;
+
   // ── Efficiency API — CAST AI managed period ───────────────────────────────
   // Fetched from max(firstOperationAt, 90d ago) to now.
   // Cost here comes from efficiency items (cpuCost + ramCost + storage).
@@ -102,6 +121,7 @@ export interface ClusterOrgSummary {
   castaiCpuUtil: number;      // avg CPU utilization % with CAST AI
   castaiCpuOverprov: number;  // avg CPU overprovisioning % WITH CAST AI — residual waste
   castaiCostPerCpuHr: number; // avg $/provisioned CPU-hour with CAST AI
+  castaiCostPerRequestedCpuHr: number; // avg $/requested CPU-hour (workload-normalized)
   castaiDays: number;         // number of days in this window
 
   // ── Efficiency API — pre-CAST AI baseline period ──────────────────────────
@@ -111,6 +131,7 @@ export interface ClusterOrgSummary {
   baselineCpuUtil: number;    // avg CPU util % BEFORE CAST AI acted
   baselineCpuOverprov: number;// avg CPU overprovisioning % BEFORE CAST AI — the "waste" before
   baselineCostPerCpuHr: number; // avg $/provisioned CPU-hour BEFORE CAST AI
+  baselineCostPerRequestedCpuHr: number;
   baselineDays: number;       // days of actual pre-CAST data available
 
   // ── Derived comparison ────────────────────────────────────────────────────
@@ -118,9 +139,20 @@ export interface ClusterOrgSummary {
   // Negative value = cost went DOWN (good). E.g. -45 means 45% cheaper.
   dailyCostDelta: number;
   costPerCpuHrDelta: number;  // % change in $/prov CPU-hr (negative = cheaper per unit)
+  costPerRequestedCpuHrDelta: number;
 
   // ── Baseline quality classification ──────────────────────────────────────
   baselineQuality: 'strong' | 'weak' | 'none';
+
+  // ── Baseline outlier detection ─────────────────────────────────────────────
+  baselineOutlierDays?: number;
+  baselineCleanedDailyCost?: number;
+  baselineOutlierImpactPct?: number;
+
+  // ── Data freshness ─────────────────────────────────────────────────────────
+  lastDataDate: string;
+  dataFreshnessDays: number;
+  dataStale: boolean;
 
   // ── Cluster mode ────────────────────────────────────────────────────────
   // 'optimizing' = CAST AI is actively managing (has firstOperationAt + savings)
@@ -139,6 +171,7 @@ export interface OrgDashboardData {
   orgName: string;
   displayName: string;
   clusters: ClusterOrgSummary[];
+  commitments?: CommitmentSummary;
 }
 
 function computeBaselineQuality(createdAt?: string, firstOpAt?: string): {
@@ -180,9 +213,9 @@ export async function GET(
   const readyClusters = allClusters.filter((c) => c.status === 'ready');
 
   const now = new Date();
+  const today = now.toISOString().slice(0, 10);
   const end = now.toISOString();
   const start90 = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString();
-  const start14 = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000).toISOString();
 
   const summaries = await Promise.allSettled(
     readyClusters.map(async (cluster): Promise<ClusterOrgSummary> => {
@@ -210,14 +243,20 @@ export async function GET(
       ]);
 
       // ── Savings API ──────────────────────────────────────────────────────
-      const savings90d =
-        savingsRes.status === 'fulfilled'
-          ? parseFloat(savingsRes.value.summary?.totalSavings ?? '0')
-          : 0;
-      const cost90d =
-        savingsRes.status === 'fulfilled'
-          ? parseFloat(savingsRes.value.summary?.totalCost ?? '0')
-          : 0;
+      let savings90d = 0;
+      let cost90d = 0;
+      let spotSavings90d = 0;
+      let rightsizingSavings90d = 0;
+
+      if (savingsRes.status === 'fulfilled' && savingsRes.value) {
+        savings90d = parseFloat(savingsRes.value.summary?.totalSavings ?? '0');
+        cost90d = parseFloat(savingsRes.value.summary?.totalCost ?? '0');
+        // Decompose savings into spot vs rightsizing from items
+        for (const item of savingsRes.value.items ?? []) {
+          spotSavings90d += parseFloat(item.spotSavings ?? '0') || 0;
+          rightsizingSavings90d += parseFloat(item.downscalingSavings ?? '0') || 0;
+        }
+      }
       const savingsPct = cost90d + savings90d > 0
         ? (savings90d / (cost90d + savings90d)) * 100
         : 0;
@@ -236,6 +275,33 @@ export async function GET(
           : [];
       const baseline = computePeriodMetrics(baselineItems);
 
+      // ── Baseline outlier detection ─────────────────────────────────────
+      // Convert baseline items to CostDataPoint-like for outlier detection
+      const n = (s?: string) => parseFloat(s ?? '0') || 0;
+      const baselineCostPoints = baselineItems.map((item) => ({
+        date: item.timestamp?.slice(0, 10) ?? '',
+        totalCost: (
+          n(item.cpuCostOnDemand) + n(item.cpuCostSpot) + n(item.cpuCostSpotFallback) +
+          n(item.ramCostOnDemand) + n(item.ramCostSpot) + n(item.ramCostSpotFallback) +
+          n(item.storageCost)
+        ) * 24,
+        computeCost: 0,
+      }));
+      const outliers = detectBaselineOutliers(baselineCostPoints);
+
+      // ── Data freshness ─────────────────────────────────────────────────
+      let lastDataDate = '';
+      if (castaiItems.length > 0) {
+        lastDataDate = castaiItems.reduce(
+          (latest, item) => (item.timestamp > latest ? item.timestamp : latest),
+          castaiItems[0].timestamp,
+        ).slice(0, 10);
+      }
+      const dataFreshnessDays = lastDataDate
+        ? Math.max(0, Math.round((Date.now() - new Date(lastDataDate).getTime()) / 86400000))
+        : Infinity;
+      const dataStale = dataFreshnessDays > 7;
+
       // ── Derived deltas ───────────────────────────────────────────────────
       const dailyCostDelta =
         baseline.dailyCost > 0 && castai.dailyCost > 0
@@ -244,6 +310,10 @@ export async function GET(
       const costPerCpuHrDelta =
         baseline.costPerCpuHr > 0 && castai.costPerCpuHr > 0
           ? ((castai.costPerCpuHr - baseline.costPerCpuHr) / baseline.costPerCpuHr) * 100
+          : 0;
+      const costPerRequestedCpuHrDelta =
+        baseline.costPerRequestedCpuHr > 0 && castai.costPerRequestedCpuHr > 0
+          ? ((castai.costPerRequestedCpuHr - baseline.costPerRequestedCpuHr) / baseline.costPerRequestedCpuHr) * 100
           : 0;
 
       // Detect mode: optimizing if CAST AI has acted AND produced savings
@@ -260,19 +330,30 @@ export async function GET(
         savings90d,
         cost90d,
         savingsPct,
+        spotSavings90d,
+        rightsizingSavings90d,
         castaiDailyCost: castai.dailyCost,
         castaiCpuUtil: castai.cpuUtil,
         castaiCpuOverprov: castai.cpuOverprov,
         castaiCostPerCpuHr: castai.costPerCpuHr,
+        castaiCostPerRequestedCpuHr: castai.costPerRequestedCpuHr,
         castaiDays: castai.days,
-        baselineDailyCost: baseline.dailyCost,
+        baselineDailyCost: outliers ? outliers.cleanedAvgDailyCost : baseline.dailyCost,
         baselineCpuUtil: baseline.cpuUtil,
         baselineCpuOverprov: baseline.cpuOverprov,
         baselineCostPerCpuHr: baseline.costPerCpuHr,
+        baselineCostPerRequestedCpuHr: baseline.costPerRequestedCpuHr,
         baselineDays,
         baselineQuality,
+        baselineOutlierDays: outliers?.outlierDates.length,
+        baselineCleanedDailyCost: outliers?.cleanedAvgDailyCost,
+        baselineOutlierImpactPct: outliers?.outlierImpactPct,
         dailyCostDelta,
         costPerCpuHrDelta,
+        costPerRequestedCpuHrDelta,
+        lastDataDate,
+        dataFreshnessDays: dataFreshnessDays === Infinity ? -1 : dataFreshnessDays,
+        dataStale,
         cpuUtil: castai.cpuUtil,
         firstOperationAt: cluster.firstOperationAt,
         createdAt: cluster.createdAt,
@@ -295,19 +376,27 @@ export async function GET(
       savings90d: 0,
       cost90d: 0,
       savingsPct: 0,
+      spotSavings90d: 0,
+      rightsizingSavings90d: 0,
       castaiDailyCost: 0,
       castaiCpuUtil: 0,
       castaiCpuOverprov: 0,
       castaiCostPerCpuHr: 0,
+      castaiCostPerRequestedCpuHr: 0,
       castaiDays: 0,
       baselineDailyCost: 0,
       baselineCpuUtil: 0,
       baselineCpuOverprov: 0,
       baselineCostPerCpuHr: 0,
+      baselineCostPerRequestedCpuHr: 0,
       baselineDays,
       baselineQuality,
       dailyCostDelta: 0,
       costPerCpuHrDelta: 0,
+      costPerRequestedCpuHrDelta: 0,
+      lastDataDate: '',
+      dataFreshnessDays: -1,
+      dataStale: true,
       cpuUtil: 0,
       firstOperationAt: c.firstOperationAt,
       createdAt: c.createdAt,
@@ -315,5 +404,54 @@ export async function GET(
     };
   });
 
-  return NextResponse.json({ orgName: name, displayName, clusters } satisfies OrgDashboardData);
+  // ── Commitments (optional, non-blocking) ────────────────────────────────
+  let commitmentSummary: CommitmentSummary | undefined;
+  try {
+    const rawCommitments = await getCommitments(key);
+    if (rawCommitments.length > 0) {
+      const commitments = adaptCommitments(rawCommitments);
+
+      // Fetch nodes from all clusters to compute coverage
+      const allNodeResults = await Promise.allSettled(
+        readyClusters.map((c) => listNodes(c.id, key)),
+      );
+      const nodeTypes: { instanceType: string; cpuCores: number; count: number }[] = [];
+      for (const result of allNodeResults) {
+        if (result.status === 'fulfilled') {
+          const typeMap: Record<string, number> = {};
+          for (const node of result.value) {
+            typeMap[node.instanceType] = (typeMap[node.instanceType] ?? 0) + 1;
+          }
+          for (const [type, count] of Object.entries(typeMap)) {
+            // CPU cores per node not available from nodes API — use commitment data as fallback
+            const matchingCommitment = commitments.find(
+              (c) => c.allowedUsage.instanceType === type,
+            );
+            const cpuCores = matchingCommitment?.instanceTypeCpu ?? 0;
+            nodeTypes.push({ instanceType: type, cpuCores, count });
+          }
+        }
+      }
+
+      // Use earliest firstOperationAt across clusters for timing classification
+      const firstOpDates = readyClusters
+        .filter((c) => c.firstOperationAt)
+        .map((c) => new Date(c.firstOperationAt!).getTime());
+      const earliestFirstOp = firstOpDates.length > 0
+        ? new Date(Math.min(...firstOpDates)).toISOString()
+        : undefined;
+
+      commitmentSummary = computeCommitmentSummary(commitments, earliestFirstOp, nodeTypes);
+    }
+  } catch (err) {
+    console.error('[org route] commitments fetch failed:', err);
+    // Non-blocking — org page still works without commitment data
+  }
+
+  return NextResponse.json({
+    orgName: name,
+    displayName,
+    clusters,
+    commitments: commitmentSummary,
+  } satisfies OrgDashboardData);
 }

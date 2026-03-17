@@ -132,6 +132,41 @@ export interface SavingsRecommendation {
   }[];
 }
 
+// ─── Commitments (RIs / Savings Plans / CUDs) ────────────────────────────────
+
+export interface Commitment {
+  id: string;
+  allowedUsage: { instanceType: string; instanceFamily: string; region: string };
+  count: number;
+  instanceTypeCpu: number;
+  effectiveCpu: number;
+  totalCost: number | null;      // hourly RI rate per unit; null when API omits it
+  plan: string;                  // '1yr' | '3yr'
+  state: string;                 // 'ACTIVE' | 'EXPIRED'
+  status: string;                // 'Active' | 'Inactive' in CAST AI
+  startDate: string;
+  endDate: string;
+  region: string;
+  cloudServiceProvider: string;
+}
+
+export interface CommitmentSummary {
+  totalCommitments: number;
+  activeCommitments: number;
+  expiredCommitments: number;
+  activeInCastAI: number;
+  inactiveInCastAI: number;
+  totalHourlyCost: number;
+  totalCommittedCpu: number;
+  avgCostPerCpuHr: number | null;
+  estimatedMonthlyRiSpend: number;
+  preCastAICount: number;
+  postCastAICount: number;
+  coveragePct: number;
+  missingCostCount: number;
+  commitments: Commitment[];
+}
+
 // ─── Org Efficiency Summary ───────────────────────────────────────────────────
 
 export interface OrgEfficiencySummary {

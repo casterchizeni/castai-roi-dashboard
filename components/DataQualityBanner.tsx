@@ -1,12 +1,16 @@
 'use client';
 
+import type { DataGap } from '@/lib/calculations/gaps';
+
 interface Props {
   baselineDays: number;
   hasApiError?: boolean;
   isMock?: boolean;
+  dataFreshnessDays?: number;
+  gaps?: DataGap[];
 }
 
-export default function DataQualityBanner({ baselineDays, hasApiError, isMock }: Props) {
+export default function DataQualityBanner({ baselineDays, hasApiError, isMock, dataFreshnessDays, gaps }: Props) {
   const warnings: { type: 'info' | 'warn' | 'error'; message: string }[] = [];
 
   if (isMock) {
@@ -32,6 +36,29 @@ export default function DataQualityBanner({ baselineDays, hasApiError, isMock }:
     warnings.push({
       type: 'info',
       message: `Limited baseline: only ${baselineDays} days of pre-CAST AI data. Monthly estimates are extrapolated.`,
+    });
+  }
+
+  // Data freshness warning
+  if (dataFreshnessDays != null && dataFreshnessDays > 7) {
+    warnings.push({
+      type: 'warn',
+      message: `Data is ${dataFreshnessDays} days old. The cluster may have been disconnected from CAST AI.`,
+    });
+  } else if (dataFreshnessDays != null && dataFreshnessDays > 2) {
+    warnings.push({
+      type: 'info',
+      message: `Last data received ${dataFreshnessDays} days ago.`,
+    });
+  }
+
+  // Gap detection warning
+  const middleGaps = gaps?.filter((g) => g.position === 'middle') ?? [];
+  if (middleGaps.length > 0) {
+    const totalMissingDays = middleGaps.reduce((s, g) => s + g.durationDays, 0);
+    warnings.push({
+      type: 'warn',
+      message: `${totalMissingDays} days of missing data detected in ${middleGaps.length} gap${middleGaps.length !== 1 ? 's' : ''}. Averages reflect only days with data.`,
     });
   }
 

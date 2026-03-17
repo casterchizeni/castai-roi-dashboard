@@ -14,12 +14,14 @@ import {
   Legend,
 } from 'recharts';
 import type { CostDataPoint } from '@/types/castai';
+import type { DataGap } from '@/lib/calculations/gaps';
 import { computeGraphDerivedSavings } from './EfficiencyTrendChart';
 
 interface Props {
   data: CostDataPoint[];
   castaiEnabledAt?: string;
   loading?: boolean;
+  gaps?: DataGap[];
 }
 
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -51,7 +53,7 @@ function CostTooltip({ active, payload, label }: any) {
   );
 }
 
-export default function DailyCostChart({ data, castaiEnabledAt, loading }: Props) {
+export default function DailyCostChart({ data, castaiEnabledAt, loading, gaps }: Props) {
   const [range, setRange] = useState<Range>('ALL');
   const [showLines, setShowLines] = useState({
     total: true,
@@ -214,6 +216,21 @@ export default function DailyCostChart({ data, castaiEnabledAt, loading }: Props
               label={{ value: 'Baseline (all pre-autoscaler data)', position: 'insideTopLeft', fontSize: 11, fill: '#475569' }}
             />
           )}
+
+          {/* Data gap bands */}
+          {gaps?.filter((g) => g.position === 'middle').map((gap, i) => (
+            <ReferenceArea
+              key={`gap-${i}`}
+              x1={gap.startDate}
+              x2={gap.endDate}
+              fill="#9ca3af"
+              fillOpacity={0.15}
+              stroke="#9ca3af"
+              strokeOpacity={0.3}
+              strokeDasharray="2 2"
+              label={i === 0 ? { value: 'No data', position: 'insideTop', fontSize: 10, fill: '#6b7280' } : undefined}
+            />
+          ))}
 
           {LINE_CONFIG.map(({ key, color, width, dash }) =>
             showLines[key as keyof typeof showLines] ? (
