@@ -86,10 +86,17 @@ The CAST AI efficiency API has a 365-day limit per request. For clusters older t
 - **Efficiency tracking** — CPU/RAM provisioned vs requested vs used, overprovisioning detection
 - **Node analysis** — pre-CAST vs now comparison of provisioned capacity, spot %, overprovisioning
 - **Export** — PDF export and print-friendly report view
+- **RI/Commitment visibility** — fetches Reserved Instances from CAST AI Commitments API, cross-references with cluster nodes for coverage %, three-layer cost decomposition (on-demand → RI → CAST AI optimized), inactive RI warnings
+- **Savings decomposition** — spot vs rightsizing breakdown from CAST AI savings API items
+- **$/requested-CPU-hr** — workload-growth-normalized cost metric alongside $/provisioned-CPU-hr
+- **Gap detection** — identifies missing data periods in efficiency time series, renders gray bands on charts
+- **Baseline outlier detection** — IQR method flags anomalous days that skew baseline averages
+- **Data freshness** — tracks last data date per cluster, warns when data is stale (>7 days)
 
 ## What's To Be Done
 
 - **Data snapshot/persistence layer** — store historical data points so we don't depend on API retention
+- **RI utilization tracking** — when commitment management is enabled in CAST AI, track CPU-hour utilization of reserved capacity over time
 - **Customer health scoring** — aggregate metrics into a simple health score per org
 - **Onboarding tracker** — track new cluster onboarding progress and time-to-value
 - **Multi-customer portfolio view** — TAM view across all their customer orgs
